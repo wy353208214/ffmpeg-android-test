@@ -1,0 +1,201 @@
+#include <jni.h>
+#include <string>
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
+#include <android/log.h>
+#include <stdio.h>
+#include <unistd.h>
+
+// Android 打印 Log
+#define LOGD(FORMAT, ...) __android_log_print(ANDROID_LOG_ERROR, "player", FORMAT, ##__VA_ARGS__);
+
+extern "C" {
+#include "include/libavcodec/avcodec.h"
+#include "include/libavformat/avformat.h"
+#include "include/libavfilter/avfilter.h"
+#include "include/libavutil/imgutils.h"
+#include "include/libavutil/samplefmt.h"
+#include "include/libswscale/swscale.h"
+#include "include/libswresample/swresample.h"
+#include "include/libavutil/frame.h"
+}
+
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_qpidnetwork_com_ffplayer_MainActivity_stringFromJNI(
+        JNIEnv *env,
+        jobject /* this */) {
+    std::string hello = "Hello from C++";
+    return env->NewStringUTF(hello.c_str());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_qpidnetwork_com_ffplayer_FFPlayer_play(JNIEnv *env, jobject object, jstring path,
+                                            jobject surface) {
+    int result;
+    if (path == NULL) {
+        LOGD("Path is null");
+        return;
+    }
+    const char *v_path = env->GetStringUTFChars(path, NULL);
+    av_register_all();
+    AVFormatContext *avFormatContext = avformat_alloc_context();
+    result = avformat_open_input(&avFormatContext, v_path, NULL, NULL);
+    if (result < 0) {
+        LOGD("Player Error : Can not open video file");
+        return;
+    }
+    result = avformat_find_stream_info(avFormatContext, NULL);
+    if (result < 0) {
+        LOGD("");
+        return;
+    }
+    int video_stream_index = -1;
+    for (int i = 0; i < avFormatContext->nb_streams; i++) {
+        if (avFormatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_stream_index = i;
+            break;
+        }
+    }
+    AVCodecContext *codecContext = avcodec_alloc_context3(NULL);
+    LOGD("time_base is %lf", av_q2d(codecContext->time_base));
+
+    //设置视频帧率 30帧
+//    codecContext->time_base.den = 30;
+//    codecContext->time_base.num = 1;
+
+    avcodec_parameters_to_context(codecContext,
+                                  avFormatContext->streams[video_stream_index]->codecpar);
+    AVCodec *avCodec = avcodec_find_decoder(codecContext->codec_id);
+    avcodec_open2(codecContext, avCodec, NULL);
+
+    avFormatContext->duration;
+    LOGD("视频格式：%s", avFormatContext->iformat->name);
+    LOGD("视频时长：%lld", (avFormatContext->duration) / 1000000);
+//    return;
+    ANativeWindow *native_window = ANativeWindow_fromSurface(env, surface);
+    if (native_window == NULL) {
+        LOGD("Player Error : Can not create native window");
+        return;
+    }
+
+    //1、窗口宽高
+    int window_width = ANativeWindow_getWidth(native_window);
+    int window_height = ANativeWindow_getHeight(native_window);
+    LOGD("ANativeWindow的宽度和高度 W：%d ,H：%d", window_width, window_height);
+    //2、原视频宽高
+    int v_width = codecContext->width;
+    int v_height = codecContext->height;
+    LOGD("视频的宽度和高度 W：%d ,H：%d", v_width, v_height);
+
+    //将视频宽缩小到windows的宽度，同时等比缩放视频高度，保证不变形
+    int video_width = v_width;
+    int video_height = v_height;
+
+    // 定义绘图缓冲区
+    ANativeWindow_Buffer window_buffer;
+    // R5 解码前数据容器 Packet 编码数据
+    AVPacket *packet = av_packet_alloc();
+    // R6 解码后数据容器 Frame 像素数据 不能直接播放像素数据 还要转换
+    AVFrame *frame = av_frame_alloc();
+    // R7 转换后数据容器 这里面的数据可以用于播放
+    AVFrame *rgba_frame = av_frame_alloc();
+
+    // 数据格式转换准备
+    // 输出 Buffer
+    int buffer_size = av_image_get_buffer_size(AV_PIX_FMT_RGBA, video_width, video_height, 1);
+    // R8 申请 Buffer 内存
+    std::uint8_t *out_buffer = (uint8_t *) av_malloc(buffer_size * sizeof(uint8_t));
+    av_image_fill_arrays(rgba_frame->data, rgba_frame->linesize, out_buffer, AV_PIX_FMT_RGBA,
+                         video_width, video_height, 1);
+    // R9 数据格式转换上下文
+    struct SwsContext *data_convert_context = sws_getContext(
+            video_width, video_height, codecContext->pix_fmt,
+            video_width, video_height, AV_PIX_FMT_RGBA,
+            SWS_BICUBIC, NULL, NULL, NULL);
+
+    //8.准备绘制
+    //配置绘制信息 宽高 格式(这个绘制的宽高直接决定了视频在屏幕上显示的情况，这样会平铺整个屏幕，可以根据特定的屏幕分辨率和视频宽高进行匹配)
+    ANativeWindow_setBuffersGeometry(native_window, video_width, video_height, WINDOW_FORMAT_RGBA_8888);
+
+//    ANativeWindow_setBuffersGeometry(native_window, video_width,
+//                                 video_width * window_height / window_width, // 重新计算绘制区域的高度，防止纵向变形
+//                                 WINDOW_FORMAT_RGBA_8888);
+
+//    bool isVertical = video_height >= video_width;
+//    if (isVertical) {
+//        ANativeWindow_setBuffersGeometry(native_window, video_width,
+//                                     video_width * window_height / window_width, // 重新计算绘制区域的高度，防止纵向变形
+//                                     WINDOW_FORMAT_RGBA_8888);
+//    }else {
+//        ANativeWindow_setBuffersGeometry(native_window, video_height,
+//                                         video_height * window_width / window_height, // 重新计算绘制区域的高度，防止纵向变形
+//                                         WINDOW_FORMAT_RGBA_8888);
+//    }
+
+    // 开始读取帧
+    while (av_read_frame(avFormatContext, packet) >= 0) {//开始读每一帧的数据
+        if (packet->stream_index == video_stream_index) {//如果这是一个视频流
+            //7.解封装（将packet解压给frame，即：拿到了视频数据frame）
+            result = avcodec_send_packet(codecContext, packet);
+            if (result < 0 && result != AVERROR(EAGAIN) && result != AVERROR_EOF) {
+                LOGD("Player Error : codec step 1 fail");
+                return;
+            }
+            avcodec_receive_frame(codecContext, frame);
+
+            ANativeWindow_lock(native_window, &window_buffer, NULL);//锁定画布(outBuffer中将会得到数据)
+            //9.转码（转码上下文，原数据，一行数据，开始位置，yuv的缓冲数组，yuv一行的数据）
+            sws_scale(data_convert_context, (const uint8_t *const *) frame->data, frame->linesize,
+                      0, frame->height, rgba_frame->data,
+                      rgba_frame->linesize
+            );
+            //10.绘制
+            uint8_t *dst = (uint8_t *) window_buffer.bits; //实际的位数
+            int destStride = window_buffer.stride * 4; //拿到一行有多少个字节 RGBA
+            uint8_t *src = (uint8_t *) rgba_frame->data[0];//像素数据的首地址
+            int srcStride = rgba_frame->linesize[0]; //实际内存一行的数量
+
+            for (int i = 0; i < video_height; ++i) {
+                //将rgb_Frame缓冲区里面的数据一行一行copy到window的缓冲区里面
+                //copy到window缓冲区的时候进行一些偏移设置可以将视频播放居中
+                memcpy(dst + i * destStride, src + i * srcStride, srcStride);
+            }
+
+            ANativeWindow_unlockAndPost(native_window);//解锁画布
+//            usleep(1000 * 30);//可以根据帧率休眠10ms
+
+        }
+        av_packet_unref(packet);
+    }
+
+    // 释放 R9
+    sws_freeContext(data_convert_context);
+    // 释放 R8
+    av_free(out_buffer);
+    // 释放 R7
+    av_frame_free(&rgba_frame);
+    // 释放 R6
+    av_frame_free(&frame);
+    // 释放 R5
+    av_packet_free(&packet);
+    // 释放 R4
+    ANativeWindow_release(native_window);
+    // 关闭 R3
+    avcodec_close(codecContext);
+    // 释放 R2
+    avformat_close_input(&avFormatContext);
+    // 释放 R1
+    env->ReleaseStringUTFChars(path, v_path);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_qpidnetwork_com_ffplayer_FFPlayer_pause(JNIEnv *env, jobject object) {
+
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_qpidnetwork_com_ffplayer_FFPlayer_release(JNIEnv *env, jobject object) {
+
+}
